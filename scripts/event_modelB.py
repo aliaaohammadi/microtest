@@ -1,7 +1,9 @@
 from pathlib import Path
 import numpy as np
 import pandas as pd
-
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -296,10 +298,199 @@ def evaluate_lopo_with_hmm(feat_df: pd.DataFrame):
     print("Confusion:\n", confusion_matrix(yA, pA))
 
 
+
+# 2) NEW: collect per-participant sequences and plot them
+#    (posterior over windows, per task/trial/repetition)
+# ------------------------------------------------------------
+def plot_participant_sequences(seq_df: pd.DataFrame,
+                               pid: int,
+                               tasks: list[str] | None = None,
+                               max_plots: int = 12):
+    """
+    seq_df: dataframe produced inside evaluation (with post_drunk & q_drunk)
+    pid: participant id to plot
+    tasks: optional list of task names to filter, e.g., ["slalom", "brake"]
+    max_plots: limit number of sequences plotted to avoid huge figures
+    """
+    dfp = seq_df[seq_df["participant"] == pid].copy()
+    if tasks is not None:
+        dfp = dfp[dfp["task"].isin(tasks)]
+
+    if dfp.empty:
+        print(f"No sequences found for participant P{pid:03d} with tasks={tasks}")
+        return
+
+    # each file = one sequence; file name already encodes task/repetition/etc
+    groups = list(dfp.groupby(["file", "task", "repetition", "intox_level"]))
+    groups = groups[:max_plots]
+
+    n = len(groups)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 2.2 * n), sharex=False)
+    if n == 1:
+        axes = [axes]
+
+    for ax, ((file_name, task, rep, lvl), g) in zip(axes, groups):
+        g = g.sort_values("window")
+        t_sec = g["window"].to_numpy() * (step_size / fs)  # approx time axis
+        ax.plot(t_sec, g["post_drunk"].to_numpy(), label="posterior P(drunk|x1:t)")
+        ax.plot(t_sec, g["q_drunk"].to_numpy(), alpha=0.4, label="per-window q=P(drunk|x_t)")
+        ax.axhline(0.5, linestyle="--", linewidth=1)
+        ax.axhline(THRESHOLD, linestyle="--", linewidth=1)
+
+        title = f"P{pid:03d} | task={task} | rep={rep} | level={lvl} | y_true={int(lvl>0)}"
+        ax.set_title(title)
+        ax.set_ylabel("P(drunk)")
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, alpha=0.25)
+
+    axes[-1].set_xlabel("time (s)")
+    axes[0].legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+
+# 3) MODIFY evaluate_lopo_with_hmm to RETURN seq_df for plotting
+# ------------------------------------------------------------
+def evaluate_lopo_with_hmm(feat_df: pd.DataFrame, return_sequences: bool = True):
+    meta_cols = {"participant","intox_level","vehicle","repetition","task","window","file","y_true"}
+    feature_cols = [c for c in feat_df.columns if c not in meta_cols]
+
+    logo = LeaveOneGroupOut()
+    groups = feat_df["participant"].to_numpy()
+    y = feat_df["y_true"].to_numpy()
+
+    A = make_binary_transition(P_STAY)
+    init_prior = np.array([1.0 - PRIOR_DRUNK, PRIOR_DRUNK], float)
+
+    all_win_true, all_win_pred = [], []
+    all_trial_true, all_trial_pred = [], []
+    all_alarm_true, all_alarm_pred = [], []
+
+    # NEW: store all sequential outputs across all folds
+    seq_all = []
+
+    for fold, (tr_idx, te_idx) in enumerate(logo.split(feat_df, y, groups=groups), start=1):
+        train = feat_df.iloc[tr_idx].copy()
+        test  = feat_df.iloc[te_idx].copy()
+
+        y_tr = train["y_true"].to_numpy()
+        pi = np.array([np.mean(y_tr == 0), np.mean(y_tr == 1)], float)
+        pi = pi / (pi.sum() + 1e-12)
+
+        model = make_window_model()
+        model.fit(train[feature_cols].to_numpy(), y_tr)
+
+        seq_out = []
+        for file_name, df_seq in test.groupby("file"):
+            df_seq = df_seq.sort_values("window")
+            X = df_seq[feature_cols].to_numpy()
+
+            q = model.predict_proba(X)
+            lik = np.clip(q / (pi.reshape(1,2) + 1e-12), 1e-12, None)
+            post = hmm_forward_binary(lik, A, init_prior)
+
+            tmp = df_seq.copy()
+            tmp["q_drunk"] = q[:, 1]
+            tmp["post_drunk"] = post[:, 1]
+            tmp["fold"] = fold
+            seq_out.append(tmp)
+
+        seq_test = pd.concat(seq_out, ignore_index=True)
+        seq_all.append(seq_test)
+
+        # window-level
+        y_true_w = seq_test["y_true"].to_numpy()
+        y_pred_w = (seq_test["post_drunk"].to_numpy() >= 0.5).astype(int)
+        all_win_true.append(y_true_w)
+        all_win_pred.append(y_pred_w)
+
+        # trial-level
+        last = (seq_test.sort_values(["file","window"])
+                        .groupby("file", as_index=False)
+                        .tail(1))
+        y_true_t = last["y_true"].to_numpy()
+        y_pred_t = (last["post_drunk"].to_numpy() >= 0.5).astype(int)
+        all_trial_true.append(y_true_t)
+        all_trial_pred.append(y_pred_t)
+
+        # alarm-level
+        mx = seq_test.groupby("file")["post_drunk"].max()
+        y_alarm_pred = (mx.to_numpy() >= THRESHOLD).astype(int)
+        y_alarm_true = seq_test.groupby("file")["y_true"].first().to_numpy().astype(int)
+        all_alarm_true.append(y_alarm_true)
+        all_alarm_pred.append(y_alarm_pred)
+
+        print(f"[Fold {fold:02d}] held-out P{int(test['participant'].iloc[0]):03d} | "
+              f"trial bal-acc: {balanced_accuracy_score(y_true_t, y_pred_t):.3f} | "
+              f"alarm bal-acc: {balanced_accuracy_score(y_alarm_true, y_alarm_pred):.3f}")
+
+    # metrics
+    yW = np.concatenate(all_win_true); pW = np.concatenate(all_win_pred)
+    yT = np.concatenate(all_trial_true); pT = np.concatenate(all_trial_pred)
+    yA = np.concatenate(all_alarm_true); pA = np.concatenate(all_alarm_pred)
+
+    print("\n=== WINDOW (posterior>=0.5) ===")
+    print("Accuracy:", accuracy_score(yW, pW))
+    print("Balanced accuracy:", balanced_accuracy_score(yW, pW))
+    print(classification_report(yW, pW, target_names=["Sober","Drunk"]))
+
+    print("\n=== TRIAL (last posterior>=0.5) ===")
+    print("Accuracy:", accuracy_score(yT, pT))
+    print("Balanced accuracy:", balanced_accuracy_score(yT, pT))
+    print(classification_report(yT, pT, target_names=["Sober","Drunk"]))
+    print("Confusion:\n", confusion_matrix(yT, pT))
+
+    print(f"\n=== ALARM (any posterior>={THRESHOLD:.2f}) ===")
+    print("Accuracy:", accuracy_score(yA, pA))
+    print("Balanced accuracy:", balanced_accuracy_score(yA, pA))
+    print(classification_report(yA, pA, target_names=["Sober","Drunk"]))
+    print("Confusion:\n", confusion_matrix(yA, pA))
+
+    if return_sequences:
+        return pd.concat(seq_all, ignore_index=True)
+    return None
+
+
+
+
 # =============== RUN ===============
 if __name__ == "__main__":
-    feat_df = build_window_df(data_folder, normalize_per_file=True)
+
+    import matplotlib.pyplot as plt
+
+    # ---------- FEATURE CACHE ----------
+    CACHE_DIR = Path(r"C:\Users\amoh\Desktop\microtox\eventhallen\cache")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    cache_file = CACHE_DIR / f"features_voi_fs{fs}_w{window_sec}_ov{overlap}.parquet"
+
+    if cache_file.exists():
+        feat_df = pd.read_parquet(cache_file)
+        print("Loaded cached features:", cache_file)
+    else:
+        feat_df = build_window_df(data_folder, normalize_per_file=True)
+        feat_df.to_parquet(cache_file, index=False)
+        print("Saved cached features:", cache_file)
+
     print("Window dataset shape:", feat_df.shape)
     print("Class balance:\n", feat_df["y_true"].value_counts())
 
-    evaluate_lopo_with_hmm(feat_df)
+    # ---------- TRAIN + SEQUENTIAL BAYES ----------
+    seq_df = evaluate_lopo_with_hmm(feat_df, return_sequences=True)
+
+    # ---------- CHECK AVAILABLE PARTICIPANTS ----------
+    print("\nParticipants available for plotting:")
+    print(sorted(seq_df["participant"].unique()))
+
+    # ---------- PLOT POSTERIOR EVOLUTION ----------
+    pid_to_plot = 12  # change this to any participant id you want
+
+    print(f"\nPlotting probability evolution for participant P{pid_to_plot:03d}")
+    plot_participant_sequences(
+        seq_df,
+        pid=pid_to_plot,
+        tasks=None,     # or ["slalom"] etc.
+        max_plots=12
+    )
+
+    plt.show()
